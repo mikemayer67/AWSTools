@@ -31,7 +31,35 @@ class S3BytesRDDUploader:
             raise RuntimeError(f"No data to upload to S3")
 
         self.data = self._consolidate_bytes()
-        self._partition_for_s3()
+        self.data = self._partition_for_s3()
+
+        s3 = boto3.client('s3')
+        mpu = s3.create_multipart_upload(Bucket=self.bucket, Key=self.key)
+
+        uploader = PartUploader(mpu)
+        result = self.data.map(uploader).collect()
+
+        if all(r['success'] for r in result):
+            parts = [{'PartNumber':i+1, 'ETag':r['ETag']} 
+                     for i,r in enumerate(result) ]
+
+            s3.complete_multipart_upload(
+                Bucket=self.bucket,
+                Key=self.key,
+                MultipartUpload={'Parts':parts},
+                UploadId=mpu['UploadId'])
+
+        else:
+
+            s3.abort_multipart_upload(
+                Bucket=self.bucket,
+                Key=self.key,
+                UploadId=mpu['UploadId'])
+
+            error = ", ".join( r['error'] for r in result if not r['success'] )
+
+            raise RuntimeError(
+                f"Failed to upload s3://{self.bucket}/{self.key}\n   {error}")
 
         self.uploaded = True
 
@@ -59,8 +87,8 @@ class S3BytesRDDUploader:
         return rval
 
     def _partition_for_s3(self):
-        rdd = self.data[0]
-        for x in self.data[1:]:
+        rdd = self.data[0].context.emptyRDD()
+        for x in self.data:
             rdd = rdd.union(x)
 
         lengths = rdd.map(lambda x:len(x)).collect()
@@ -68,9 +96,12 @@ class S3BytesRDDUploader:
         partitioner = S3Partitioner()
         parts = [partitioner(x) for x in lengths]
 
-        rdd = rdd.zipWithIndex().map(lambda x:(x[0],(parts[x[1]],x[1])))
-        self.data = rdd
-
+        return (rdd
+               .zipWithIndex()
+               .map(lambda x:(x[0],(parts[x[1]],x[1])))
+               .groupBy(lambda x:x[1][0])
+               .map(lambda x:(x[0],b"".join(t[0] for t in x[1])))
+              )
 
 class BytePrepender:
     def __init__(self,bstr):
@@ -93,6 +124,27 @@ class S3Partitioner:
         rval = self.cur[1]
         self.cur = (0,rval+1) if size > 5*1024*1024 else (size,rval)
         return rval
+
+class PartUploader:
+    def __init__(self,mpu):
+        self.bucket = mpu["Bucket"]
+        self.key = mpu["Key"]
+        self.uploadId = mpu["UploadId"]
+    def __call__(self,x):
+        s3 = boto3.client("s3")
+        try:
+            part = s3.upload_part(
+                Bucket = self.bucket,
+                Key = self.key,
+                PartNumber = 1 + x[0],
+                UploadId = self.uploadId,
+                Body = x[1])
+        except Exception as e:
+            return {"success":False, "error":f"Failed to load part {1+x[0]}"}
+        
+        return {"success":True, "ETag":part["ETag"]}
+
+        
 
 def validate_data(data_list):
     """Validates data to be added to an S3BytesRDDUploader
