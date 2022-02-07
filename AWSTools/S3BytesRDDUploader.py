@@ -1,4 +1,3 @@
-
 import boto3
 from pyspark.rdd import RDD
 
@@ -104,18 +103,18 @@ class S3BytesRDDUploader:
         if not sc:
             raise RuntimeError("Data must contain at least one RDD")
 
-        bstr = list()
+        bstr = b""
         for item in self.data:
             if type(item) is bytes:
-                bstr.append(item)
+                bstr += item
             else:
                 if bstr:
-                    rdds.append( sc.parallelize(bstr) )
-                    bstr = list()
+                    rdds.append( sc.parallelize([bstr]) )
+                    bstr = b""
                 rdds.append(item)
 
         if bstr:
-            rdds.append( sc.parallelize(bstr) )
+            rdds.append( sc.parallelize([bstr]) )
 
         # merge all RDDs into a single RDD
         rdd = rdds[0]
